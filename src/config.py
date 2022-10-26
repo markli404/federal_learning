@@ -4,17 +4,17 @@ import torch
 class config:
     # frequently used
     CLASS_SWAP = True
-    RUNTYPE = "case_study"
+    RUNTYPE = "fedpns" #"case_study"
     RUN_NAME = None
     BASE = None
 
     # 'class_intro_our_c_2_0.05_{}'
-    RUN_NAME_ALL = 'class_swap_casestudy_frac_{}_{}_with_0.3' # 'class_intro_fed_avg_freq_{}_{}' #_coeff0.4_with_reduced_freq=0.15'
+    RUN_NAME_ALL = 'fedpns_50_clients_{}_{}' # 'class_intro_fed_avg_freq_{}_{}' #_coeff0.4_with_reduced_freq=0.15'
     GRADIENT = False
-    NUM_CLIENTS = 40
+    NUM_CLIENTS = 10
     NUM_ROUNDS = 20
-    NUM_TRAINING_SAMPLES = 100                      # number of samples added to local training set
-    NUM_TEST_SAMPLES = 200                          # number of samples in the test set
+    NUM_TRAINING_SAMPLES = 50                      # number of samples added to local training set
+    NUM_TEST_SAMPLES = 10                          # number of samples in the test set
     DRIFT = 0.5                                     # when drift happens
     FRACTION = 0.1                                 # percentage of clients selected each round
     MODEL_COEFF = 1

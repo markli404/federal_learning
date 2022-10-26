@@ -54,8 +54,9 @@ class Client(object):
 
     def get_gradient(self):
         grad = np.subtract(self.global_model.flatten_model(), self.model.flatten_model())
-
-        return grad / (len(self.train) * self.local_epoch * config.OPTIMIZER_CONFIG['lr'] / self.batch_size)
+        # return grad / (args.num_sample * args.local_ep * lr / args.local_bs)
+        grad = grad / (len(self.train) * self.local_epoch * config.OPTIMIZER_CONFIG['lr'] / self.batch_size)
+        return grad
 
     def __len__(self):
         """Return a total size of the client's local data."""

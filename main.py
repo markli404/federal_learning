@@ -5,10 +5,10 @@ from src.config import config
 import numpy as np
 
 def fedavg():
-    fraction = [1]
+    fraction = [0.8]
     for f in fraction:
         accuracy = []
-        for i in range(10):
+        for i in range(1):
             config.FRACTION = f
             config.RUN_NAME = config.RUN_NAME_ALL.format(f, i)
 

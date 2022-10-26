@@ -73,22 +73,24 @@ class Server(object):
 
     def create_clients(self, distribution):
         clients = []
+        drift_count = 0
         for k in range(self.num_clients):
             if distribution is None:
-                num = 4
+                num = 6
                 initial_distribution = np.zeros(10)
                 idxs = np.random.choice(10, num, replace=False)
                 for idx in idxs:
                     initial_distribution[idxs] = 1 / num
 
                 client = Client(client_id=k, device=self.device, distribution=initial_distribution)
-                x = (initial_distribution[1] != 0)
-                client.temporal_heterogeneous = x
+                if initial_distribution[1] != 0:
+                    client.temporal_heterogeneous = True
+                    drift_count += 1
             else:
                 client = Client(client_id=k, device=self.device, distribution=distribution)
             clients.append(client)
 
-        self.log(f"...successfully created all {str(self.num_clients)} clients!")
+        self.log(f"...successfully created all {str(self.num_clients)} clients! {str(drift_count / self.num_clients)} number of client will drift!")
         return clients
 
 
@@ -145,7 +147,7 @@ class Server(object):
         fedavg_coeff = np.array(fedavg_coeff) / sum(fedavg_coeff)
         fedavg_model = self.aggregate_models(sampled_client_indices, fedavg_coeff, with_previous_model=False)
 
-        if self.runtype in ['fedavg', 'case_study']:
+        if self.runtype in ['fedavg', 'case_study', 'fedpns']:
             self.model = fedavg_model
             message = f"...updated weights of {len(sampled_client_indices)} clients are successfully averaged!"
         else:
@@ -225,6 +227,30 @@ class Server(object):
         # update model parameters of the selected clients and update the global model
         self.update_model(sampled_client_indices)
 
+    def train_fedpns(self):
+        # assign new training and test set based on distribution
+        self.DatasetController.update_clients_datasets(self.clients, (self._round >= config.DRIFT * config.NUM_ROUNDS))
+
+        # train all clients model with local dataset
+        message = self.CommunicationController.update_selected_clients(all_client=True)
+        self.log(message)
+
+        # select clients based on weights
+        _, test_set = self.get_test_dataset()
+        message, sampled_client_indices = self.CommunicationController.sample_clients_fed_pns(self.clients, test_set)
+        self.log(message)
+
+        # evaluate selected clients with local dataset
+        message = self.CommunicationController.evaluate_selected_models()
+        self.log(message)
+
+        # update model parameters of the selected clients and update the global model
+        self.update_model(sampled_client_indices)
+
+        # send global model to the selected clients
+        message = self.CommunicationController.transmit_model(self.model, True)
+        self.log(message)
+
     def train_federated_model(self):
         """Do federated training."""
         # assign new training and test set based on distribution
@@ -284,22 +310,10 @@ class Server(object):
     def evaluate_global_model(self):
         """Evaluate the global model using the global holdout dataset (self.data)."""
         # calculate the sample distribution of all clients
-        global_distribution = np.zeros(config.NUM_CLASS)
-        for client in self.clients:
-            global_distribution += client.distribution
-        global_distribution = global_distribution / sum(global_distribution)
-
-
-        global_test_set = None
-        for client in self.clients:
-            if global_test_set is None:
-                global_test_set = client.test
-            else:
-                global_test_set + client.test
+        global_distribution, global_test_set = self.get_test_dataset()
 
         message = pretty_list(global_distribution)
         self.log(f"Current test set distribution: [{str(message)}]. ")
-
         # start evaluation process
         self.model.eval()
         self.model.to(self.device)
@@ -364,6 +378,22 @@ class Server(object):
 
                 self.log(f"Client {str(client.id)} has a shifted distribution: {str(client.distribution)}")
 
+    def get_test_dataset(self):
+        global_distribution = np.zeros(config.NUM_CLASS)
+        for client in self.clients:
+            global_distribution += client.distribution
+        global_distribution = global_distribution / sum(global_distribution)
+
+
+        global_test_set = None
+        for client in self.clients:
+            if global_test_set is None:
+                global_test_set = client.test
+            else:
+                global_test_set + client.test
+
+        return global_distribution, global_test_set
+
     def class_swap(self, client, class_1=1, class_2=2):
         client.train.class_swap(class_1, class_2)
         client.test.class_swap(class_1, class_2)
@@ -375,7 +405,7 @@ class Server(object):
 
             # assign new distribution to drfited clients
             if config.DRIFT * config.NUM_ROUNDS == self._round:
-                config.FRACTION = 0.3
+                # config.FRACTION = 0.6
                 if config.CLASS_SWAP:
                     drift = []
                     for client in self.clients:
@@ -409,6 +439,8 @@ class Server(object):
                 self.train_case_study()
             elif config.RUNTYPE == 'our':
                 self.train_federated_model_test()
+            elif config.RUNTYPE == 'fedpns':
+                self.train_fedpns()
 
             # evaluate the model
             self.evaluate_global_model()
