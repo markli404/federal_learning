@@ -35,20 +35,46 @@ class CustomTensorDataset(Dataset):
 
         self.tensors = (data, label)
 
+    def sort_by_class(self):
+        sorted_dataset_by_class = []
+        images = self.tensors[0].numpy()
+        images = images.reshape((images.shape[0], images.shape[1] * images.shape[2] * images.shape[3]))
+        labels = self.tensors[1].numpy()
+
+        for i in np.unique(labels):
+            idx = np.where(labels == i)
+            sorted_dataset_by_class.append(images[idx, :][0])
+
+        return sorted_dataset_by_class
+
     def get_dataloader(self):
         return DataLoader(self, batch_size=self.batch_size, shuffle=True)
 
     def class_swap(self, class_1, class_2):
         labels = self.tensors[1].numpy()
         class_1_labels = np.array(labels == class_1).astype(int)
-        # class_2_labels = np.array(labels == class_2).astype(int)
+        #class_2_labels = np.array(labels == class_2).astype(int)
 
         class_1_labels = class_1_labels * (class_2 - class_1)
-        # class_2_labels = class_2_labels * (class_1 - class_2)
+        #class_2_labels = class_2_labels * (class_1 - class_2)
 
-        labels += class_1_labels # + class_2_labels
+        labels += class_1_labels #+ class_2_labels
         self.tensors = (self.tensors[0], torch.Tensor(labels))
 
+    class AddGaussianNoise(object):
+        def __init__(self, level=1):
+            self.std = level
+
+        def __call__(self, tensor):
+            return tensor + torch.randn(tensor.size()) * self.std
+
+        def __repr__(self):
+            return self.__class__.__name__ + '(mean={0}, std={1})'.format(self.mean, self.std)
+
+    def add_guassian_noise(self, level):
+        images = self.tensors[0]
+        images = images + torch.randn(images.size()) * level
+        self.tensors = (images, self.tensors[1])
 
 # 负责根据各种分布生成训练集
 class DatasetController:
@@ -61,7 +87,14 @@ class DatasetController:
                 transform = torchvision.transforms.Compose(
                     [
                         torchvision.transforms.ToTensor(),
-                        torchvision.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+                        torchvision.transforms.Normalize((0.4914, 0.4822, 0.4465), (0.5071, 0.4867, 0.4408))
+                    ]
+                )
+            elif dataset_name in ["CIFAR100"]:
+                transform = torchvision.transforms.Compose(
+                    [
+                        torchvision.transforms.ToTensor(),
+                        torchvision.transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
                     ]
                 )
             elif dataset_name in ["MNIST"]:
@@ -101,15 +134,14 @@ class DatasetController:
             training_dataset.targets = training_dataset.targets.tolist()
             test_dataset.targets = test_dataset.targets.tolist()
 
-        data = np.concatenate((training_dataset.data, test_dataset.data))
-        targets = []
-        targets.extend(training_dataset.targets)
-        targets.extend(test_dataset.targets)
+        sorted_train_data, sorted_train_indices = self.get_sorted_data_and_indices(training_dataset.data, training_dataset.targets)
+        sorted_test_data, sorted_test_indices = self.get_sorted_data_and_indices(test_dataset.data, test_dataset.targets)
 
-        sorted_data, sorted_indices = self.get_sorted_data_and_indices(data, targets)
+        self.sorted_train_data = sorted_train_data
+        self.sorted_train_indices = sorted_train_indices
+        self.sorted_test_data = sorted_test_data
+        self.sorted_test_indices = sorted_test_indices
 
-        self.sorted_data = sorted_data
-        self.sorted_indices = sorted_indices
         self.transform = transform
 
     def get_sorted_data_and_indices(self, data, targets):
@@ -128,21 +160,25 @@ class DatasetController:
 
         return data, dataset_indices
 
-    def draw_data_by_distribution(self, distribution, total_samples, remove_from_pool=True, draw_from_pool=True):
-        assert (len(self.sorted_indices), len(distribution))
-
+    def draw_data_by_distribution(self, distribution, total_samples, train=True, remove_from_pool=True, draw_from_pool=True):
         distribution = distribution * total_samples
         new_input = []
         new_label = []
         for class_id, n in enumerate(distribution):
-            selected_indices = self.draw_data_index_by_class(class_id, n, remove_from_pool, draw_from_pool)
-            new_input.extend(self.sorted_data[selected_indices])
+            selected_indices = self.draw_data_index_by_class(class_id, n, train, remove_from_pool, draw_from_pool)
+            if train:
+                new_input.extend(self.sorted_train_data[selected_indices])
+            else:
+                new_input.extend(self.sorted_test_data[selected_indices])
 
             extra = max(int(n) - len(selected_indices), 0)
             if extra > 0:
                 extra_indices = self.draw_data_index_by_class(class_id, extra, remove_from_pool=False,
                                                               draw_from_pool=False)
-                new_input.extend(self.sorted_data[extra_indices])
+                if train:
+                    new_input.extend(self.sorted_train_data[extra_indices])
+                else:
+                    new_input.extend(self.sorted_test_data[extra_indices])
 
             for _ in range(int(n)):
                 new_label.append(class_id)
@@ -152,8 +188,11 @@ class DatasetController:
 
         return new_dataset
 
-    def draw_data_index_by_class(self, class_id, n, remove_from_pool=True, draw_from_pool=True):
-        available_indices = self.sorted_indices[class_id]
+    def draw_data_index_by_class(self, class_id, n, train=True, remove_from_pool=True, draw_from_pool=True):
+        if train:
+            available_indices = self.sorted_train_indices[class_id]
+        else:
+            available_indices = self.sorted_test_indices[class_id]
 
         if draw_from_pool:
             indices = np.arange(1, len(available_indices) - 1)
@@ -162,24 +201,37 @@ class DatasetController:
         else:
             indices = np.arange(available_indices[0], available_indices[-1] + 1)
             res = np.random.choice(indices, int(n), replace=False)
+
         if remove_from_pool:
-            self.sorted_indices[class_id] = np.delete(available_indices, selected_indices)
+            if train:
+                self.sorted_train_indices[class_id] = np.delete(available_indices, selected_indices)
+            else:
+                self.sorted_test_indices[class_id] = np.delete(available_indices, selected_indices)
 
         return res
 
-    def update_clients_datasets(self, clients, swap):
+    def update_clients_datasets(self, clients, drift_clients, drift_classes, target_classes, replace=True):
         for client in clients:
-            new_train_set = self.draw_data_by_distribution(client.distribution, config.NUM_TRAINING_SAMPLES)
+            new_train_set = self.draw_data_by_distribution(client.distribution, config.NUM_TRAINING_SAMPLES, train=True)
 
-            new_test_set = self.draw_data_by_distribution(client.distribution, config.NUM_TEST_SAMPLES,
+            new_test_set = self.draw_data_by_distribution(client.distribution, config.NUM_TEST_SAMPLES, train=False,
                                                           remove_from_pool=False, draw_from_pool=False)
 
-            if client.temporal_heterogeneous and swap:
-                new_train_set.class_swap(1, 2)
-                new_test_set.class_swap(1, 2)
+            for i, drift_class in enumerate(drift_classes):
+                if client.id in drift_clients[i]:
+                    new_train_set.class_swap(drift_class, target_classes[i])
+                    new_test_set.class_swap(drift_class, target_classes[i])
 
-            client.update_train(new_train_set, replace=False)
+            client.update_train(new_train_set, replace=replace)
             client.update_test(new_test_set, replace=True)
+
+    def get_dataset_for_client(self, client):
+        new_train_set = self.draw_data_by_distribution(client.distribution, config.NUM_TRAINING_SAMPLES, train=True)
+
+        new_test_set = self.draw_data_by_distribution(client.distribution, config.NUM_TEST_SAMPLES, train=False,
+                                                          remove_from_pool=False, draw_from_pool=False)
+
+        return new_train_set, new_test_set
 
 
 def get_dataloader(data):

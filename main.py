@@ -3,12 +3,15 @@ from src.utils.Printer import Printer
 
 from src.config import config
 import numpy as np
+import pandas
 
-def fedavg():
-    fraction = [0.8]
-    for f in fraction:
+
+def main():
+    res = {}
+    for f in config.fractions:
         accuracy = []
-        for i in range(1):
+        uploads = []
+        for i in range(config.run_time):
             config.FRACTION = f
             config.RUN_NAME = config.RUN_NAME_ALL.format(f, i)
 
@@ -22,39 +25,27 @@ def fedavg():
             central_server.setup()
 
             # do federated learning
-            accu = central_server.fit()
+            accu, round_uploads = central_server.fit()
             accuracy.append(accu)
+            uploads.append(round_uploads)
             printer.print(accu)
 
         accuracy = np.array(accuracy)
-        printer.print(np.mean(accuracy,axis=0))
+        accuracy = np.mean(accuracy,axis=0)
+        uploads = np.array(uploads)
+        uploads = np.mean(uploads,axis=0)
+        res['f={}'.format(np.mean(uploads))] = accuracy
+        res['uploads_f={}'.format(np.mean(uploads))] = uploads
+        printer.print(accuracy)
+        printer.print(uploads)
 
-        # bye!
-        printer.print("...done all learning process!\n...exit program!")
-
-
-def our():
-    fraction = [0.2]
-    accuracy = []
-    for f in fraction:
-        for j in range(1):
-            config.FRACTION = f
-            config.RUN_NAME = config.RUN_NAME_ALL.format(f)
-
-            # setup tensorboard and logging printer
-            printer = Printer()
-            printer.print("\n[WELCOME] ")
-            tensorboard_writer = printer.get_tensorboard_writer()
-
-            # initialize federated learning
-            central_server = Server(tensorboard_writer)
-            central_server.setup()
-
-            # do federated learning
-            accuracy.append(central_server.fit())
-
-        printer.print(sum(accuracy) / len(accuracy))
+    if config.SAVE:
+        df = pandas.DataFrame(res)
+        df.to_csv('{}_{}_class={}_layerwise.csv'.format(config.DATASET_NAME, config.RUN_TYPE, config.NUM_SELECTED_CLASS), index=False)
+    # bye!
+    printer.print("...done all learning process!\n...exit program!")
 
 
 if __name__ == "__main__":
-    fedavg()
+    np.set_printoptions(precision=5, suppress=True)
+    main()

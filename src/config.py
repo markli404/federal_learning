@@ -3,33 +3,44 @@ import torch
 
 class config:
     # frequently used
+    DRIFT_TYPE = 'class_swap'    # class_swap guass_noise
+    DRITF_PERCENTAGE = None
     CLASS_SWAP = True
-    RUNTYPE = "fedpns" #"case_study"
+    RUN_TYPE = "new" #"case_study"
     RUN_NAME = None
     BASE = None
 
     # 'class_intro_our_c_2_0.05_{}'
-    RUN_NAME_ALL = 'fedpns_50_clients_{}_{}' # 'class_intro_fed_avg_freq_{}_{}' #_coeff0.4_with_reduced_freq=0.15'
+    RUN_NAME_ALL = 'tsf_20_clients_{}_{}' # 'class_intro_fed_avg_freq_{}_{}' #_coeff0.4_with_reduced_freq=0.15'
     GRADIENT = False
-    NUM_CLIENTS = 10
-    NUM_ROUNDS = 20
-    NUM_TRAINING_SAMPLES = 50                      # number of samples added to local training set
-    NUM_TEST_SAMPLES = 10                          # number of samples in the test set
-    DRIFT = 0.5                                     # when drift happens
-    FRACTION = 0.1                                 # percentage of clients selected each round
+    NUM_CLIENTS = 20
+    NUM_ROUNDS = 300
+    NUM_TRAINING_SAMPLES = 256                    # number of samples added to local training set
+    NUM_TEST_SAMPLES = 128                          # number of samples in the test set
+    DRIFT = [200]                                     # when drift happens
+    PERCENTAGE = 1
+    FRACTION = None                                 # percentage of clients selected each round
     MODEL_COEFF = 1
+    NUM_SELECTED_CLASS = 2
 
-    C_1 = 30
-    C_2 = 0.1
-    DECAY = 0.15
+    # main
+    run_time = 1
+    fractions = [0] # [2, 1.7, 1.1]  # 其他的 [0.2, 0.4, 0.6, 0.8, 1]               # fast的频率控制[1.1, 0.8, 0.2, -0.5, -1]
+    CACHE = False
+    FRESHNESS = False
+
+    # fractions = [0.1, 0.3, 0.5, 0.7, 0.9, 1.1, 1.3]
+    # fractions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]
+
+    SAVE = True
 
     # global config
     SEED = 5959
-    DEVICE = "cuda"
+    DEVICE = "cpu"
 
     # data config
     DATA_PATH = './data/'
-    DATASET_NAME = 'MNIST'
+    DATASET_NAME = 'CIFAR10'
     NUM_CLASS = 10
 
     # train config
@@ -41,11 +52,11 @@ class config:
     }
 
     # client config
-    LOCAL_EPOCH = 5
-    BATCH_SIZE = 20
+    LOCAL_EPOCH = 1
+    BATCH_SIZE = 256
 
     # server config
-    GLOBAL_TEST_SAMPLES = 1000
+    GLOBAL_TEST_SAMPLES = 2000
 
     # communication config
 
@@ -60,11 +71,11 @@ class config:
     # in_features: 784
     # num_hiddens: 200
     # num_classes: 10
-    #
-    MODEL_NAME = 'CNN'
+
+    MODEL_NAME = 'CNN2'
     MODEL_CONFIG = {
-        'name': 'CNN',
-        'in_channels': 1,
+        'name': 'CNN2',
+        'in_channels': 3,
         'hidden_channels': 32,
         'num_hiddens': 512,
         'num_classes': NUM_CLASS,

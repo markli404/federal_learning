@@ -5,6 +5,7 @@ from collections import OrderedDict
 # custom packages
 from .config import config
 from .utils.DatasetController import *
+
 logger = logging.getLogger(__name__)
 
 
@@ -18,8 +19,9 @@ class Client(object):
         id: Integer indicating client's id.
         train: torch.utils.data.Dataset instance containing local data.
         device: Training machine indicator (e.g. "cpu", "cuda").
-        __model: torch.nn instance as a local model.
+        client_current: torch.nn instance as a local model.
     """
+
     def __init__(self, client_id, device, distribution):
         """client training configs"""
         self.batch_size = config.BATCH_SIZE
@@ -32,28 +34,36 @@ class Client(object):
         self.id = client_id
         self.device = device
         self.distribution = distribution
-        self.temporal_heterogeneous = False
+        self.drift = False
+
+        # dataset
         self.train = None
         self.test = None
-        self.__model = None
-        self.global_model = None
+        self.test_previous = None
 
-        self.idx_t0 = 0.0
-        self.idx_t1 = 0.0
-        self.just_updated = False
+        # models
+        self.time_s = 1
+        self.freshness = 1
+        self.client_current = None
+        self.global_previous = None
+        self.client_previous = None
+        self.global_current = None
 
-    @property
-    def model(self):
-        """Local model getter for parameter aggregation."""
-        return self.__model
-
-    @model.setter
-    def model(self, model):
-        """Local model setter for passing globally aggregated model parameters."""
-        self.__model = model
+        # For scaffold only
+        self.c_local = None
+        self.c_global = None
+        self.c_delta = None
 
     def get_gradient(self):
-        grad = np.subtract(self.global_model.flatten_model(), self.model.flatten_model())
+        grad = np.subtract(self.global_current.flatten_model(), self.client_current.flatten_model())
+        # return grad / (args.num_sample * args.local_ep * lr / args.local_bs)
+        # grad = grad / (len(self.train) * self.local_epoch * config.OPTIMIZER_CONFIG['lr'] / self.batch_size)
+        return np.array(grad)
+
+    def get_gradient_s(self, model1, model2, difference=False):
+        grad = np.subtract(model1.flatten_model(), model2.flatten_model())
+        if difference:
+            return grad
         # return grad / (args.num_sample * args.local_ep * lr / args.local_bs)
         grad = grad / (len(self.train) * self.local_epoch * config.OPTIMIZER_CONFIG['lr'] / self.batch_size)
         return grad
@@ -63,7 +73,7 @@ class Client(object):
         return len(self.train)
 
     def mutate(self):
-        self.temporal_heterogeneous = True
+        self.drift = True
 
     def update_train(self, new_dataset, replace=False):
         if self.train is None or replace:
@@ -77,18 +87,26 @@ class Client(object):
         else:
             self.test + new_dataset
 
-    def client_update(self):
-        """Update local model using local dataset."""
-        self.model.train()
-        self.model.to(self.device)
+    def client_update(self, run_type):
+        if run_type == 'fedprox':
+            return self.client_update_fedprox()
+        elif run_type == 'scaffold':
+            return self.client_update_scaffold()
+        else:
+            return self.client_update_fedavg()
 
-        optimizer = eval(self.optimizer)(self.model.parameters(), **self.optim_config)
+    def client_update_fedavg(self):
+        """Update local model using local dataset."""
+        self.client_current.train()
+        self.client_current.to(self.device)
+
+        optimizer = eval(self.optimizer)(self.client_current.parameters(), **self.optim_config)
         for e in range(self.local_epoch):
             for data, labels in self.train.get_dataloader():
                 data, labels = data.float().to(self.device), labels.long().to(self.device)
-  
+
                 optimizer.zero_grad()
-                outputs = self.model(data)
+                outputs = self.client_current(data)
                 loss = eval(self.criterion)()(outputs, labels)
 
                 loss.backward()
@@ -96,27 +114,97 @@ class Client(object):
 
                 if self.device == "cuda": torch.cuda.empty_cache()
 
-        self.model.to("cpu")
+        self.client_current.to("cpu")
 
-        if self.just_updated:
-            _, global_accuracy = self.client_evaluate(current_model=False, log=False)
-            _, current_accuracy = self.client_evaluate(current_model=True, log=False)
+    def client_update_fedprox(self):
+        """Update local model using local dataset."""
+        self.client_current.train()
+        self.client_current.to(self.device)
 
-            self.idx_t0 = current_accuracy - global_accuracy
-            self.just_updated = False
+        global_weight_collector = list(self.global_current.to(self.device).parameters())
+        mu = 0.001
 
-    def client_evaluate(self, current_model=True, log=True, test_set=True):
-        """Evaluate local model using local dataset (same as training set for convenience)."""
-        if current_model:
-            model = self.model
-        else:
-            model = self.global_model
+        optimizer = eval(self.optimizer)(self.client_current.parameters(), **self.optim_config)
+        for e in range(self.local_epoch):
+            for data, labels in self.train.get_dataloader():
+                data, labels = data.float().to(self.device), labels.long().to(self.device)
 
-        if test_set:
-            dataset = self.test
-        else:
-            dataset = self.train
+                optimizer.zero_grad()
+                outputs = self.client_current(data)
+                loss = eval(self.criterion)()(outputs, labels)
 
+                fed_prox_reg = 0.0
+                for param_index, param in enumerate(self.client_current.parameters()):
+                    fed_prox_reg += ((mu / 2) * torch.norm((param - global_weight_collector[param_index])) ** 2)
+                loss += fed_prox_reg
+
+                loss.backward()
+                optimizer.step()
+
+                if self.device == "cuda": torch.cuda.empty_cache()
+
+        self.client_current.to("cpu")
+
+    def client_update_scaffold(self):
+        """Update local model using local dataset."""
+        if self.c_global is None:
+            self.c_global = copy.deepcopy(self.client_current)
+        if self.c_local is None:
+            self.c_local = copy.deepcopy(self.client_current)
+
+        self.client_current.train()
+        self.client_current.to(self.device)
+        self.c_global.to(self.device)
+        self.c_local.to(self.device)
+        self.global_current.to(self.device)
+
+        c_global_para = self.c_global.state_dict()
+        c_local_para = self.c_local.state_dict()
+        count = 0
+        optimizer = eval(self.optimizer)(self.client_current.parameters(), **self.optim_config)
+        for e in range(self.local_epoch):
+            for data, labels in self.train.get_dataloader():
+                data, labels = data.float().to(self.device), labels.long().to(self.device)
+
+                optimizer.zero_grad()
+                outputs = self.client_current(data)
+                loss = eval(self.criterion)()(outputs, labels)
+
+                loss.backward()
+                optimizer.step()
+
+                net_para = self.client_current.state_dict()
+                for key in net_para:
+                    net_para[key] = net_para[key] - config.OPTIMIZER_CONFIG['lr'] * \
+                                               (c_global_para[key] - c_local_para[key])
+                self.client_current.load_state_dict(net_para)
+                count += 1
+
+                if self.device == "cuda": torch.cuda.empty_cache()
+
+        self.client_current.to("cpu")
+        self.c_global.to("cpu")
+        self.c_local.to("cpu")
+        self.global_current.to("cpu")
+
+        c_new_para = self.c_local.state_dict()
+        c_delta_para = copy.deepcopy(self.c_local.state_dict())
+        global_current_para = self.global_current.state_dict()
+        client_current_para = self.client_current.state_dict()
+
+        c_global_para = self.c_global.state_dict()
+        c_local_para = self.c_local.state_dict()
+
+        for key in client_current_para:
+            c_new_para[key] = c_new_para[key] - c_global_para[key] + (global_current_para[key] - client_current_para[key]) / \
+                              (count * config.OPTIMIZER_CONFIG['lr'])
+
+            c_delta_para[key] = c_new_para[key] - c_local_para[key]
+        self.c_local.load_state_dict(c_new_para)
+        self.c_delta_para = c_delta_para
+        print(self.c_delta_para)
+
+    def evaluate(self, model, dataset):
         model.eval()
         model.to(self.device)
 
@@ -126,7 +214,7 @@ class Client(object):
                 data, labels = data.float().to(self.device), labels.long().to(self.device)
                 outputs = model(data)
                 test_loss += eval(self.criterion)()(outputs, labels).item()
-                
+
                 predicted = outputs.argmax(dim=1, keepdim=True)
                 correct += predicted.eq(labels.view_as(predicted)).sum().item()
 
@@ -136,14 +224,39 @@ class Client(object):
         test_loss = test_loss / len(dataset.get_dataloader())
         test_accuracy = correct / len(dataset)
 
+        return test_accuracy, test_loss
+
+    def client_evaluate(self):
+        """Evaluate local model using local dataset (same as training set for convenience)."""
+        self.client_current.eval()
+        self.client_current.to(self.device)
+
+        test_loss, correct = 0, 0
+        with torch.no_grad():
+            for data, labels in self.test.get_dataloader():
+                data, labels = data.float().to(self.device), labels.long().to(self.device)
+                outputs = self.model(data)
+                test_loss += eval(self.criterion)()(outputs, labels).item()
+
+                predicted = outputs.argmax(dim=1, keepdim=True)
+                correct += predicted.eq(labels.view_as(predicted)).sum().item()
+
+                if self.device == "cuda": torch.cuda.empty_cache()
+        self.client_current.to("cpu")
+
+        test_loss = test_loss / len(self.test.get_dataloader())
+        test_accuracy = correct / len(self.test)
+
         message = f"\t[Client {str(self.id).zfill(4)}] ...finished evaluation!\
             \n\t=> Test loss: {test_loss:.4f}\
             \n\t=> Test accuracy: {100. * test_accuracy:.2f}%\
             \n\t=> Distribution: {self.distribution}\n"
-        if log:
-            print(message, flush=True); logging.info(message)
 
-        del message; gc.collect()
+        print(message, flush=True);
+        logging.info(message)
+
+        del message;
+        gc.collect()
 
         return test_loss, test_accuracy
 
@@ -171,6 +284,3 @@ class Client(object):
             logging.info(message)
 
             return max(res, 0.000001)
-
-
-

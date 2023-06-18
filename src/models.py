@@ -58,6 +58,45 @@ class CNN(nn.Module):
         x = self.fc2(x)
         return x
 
+    def flatten_model(self, model_dict=None):
+        if model_dict is None:
+            model_dict = self.state_dict()
+        tensor = np.array([])
+
+        for key in model_dict.keys():
+            tensor = np.concatenate((tensor, model_dict[key].cpu().numpy().flatten()))
+
+        return torch.tensor(tensor).squeeze()
+
+    def unflatten_model(self, flatted_model):
+        model_dict = self.state_dict()
+
+        new_model_dict = {}
+        for key in model_dict.keys():
+            t = model_dict[key].cpu().numpy()
+            shape = t.shape
+            length = len(t.flatten())
+
+            new_tensor = flatted_model[:length]
+            flatted_model = flatted_model[length:]
+            new_tensor = np.reshape(new_tensor, shape)
+
+            new_model_dict[key] = new_tensor
+
+        return new_model_dict
+
+
+
+class LR(nn.Module):
+    def __init__(self, in_channels, name):
+        super(LR, self).__init__()
+        self.name = name
+        self.fc1 = nn.Linear(in_features=in_channels, out_features=1, bias=False)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        return x
+
     def flatten_model(self):
         model_dict = self.state_dict()
         tensor = np.array([])
@@ -66,6 +105,7 @@ class CNN(nn.Module):
             tensor = np.concatenate((tensor, model_dict[key].cpu().numpy().flatten()))
 
         return torch.tensor(tensor).squeeze()
+
 
 # for CIFAR10
 class CNN2(nn.Module):
@@ -96,6 +136,33 @@ class CNN2(nn.Module):
         x = self.fc2(x)
         
         return x
+
+    def flatten_model(self, model_dict=None):
+        if model_dict is None:
+            model_dict = self.state_dict()
+        tensor = np.array([])
+
+        for key in model_dict.keys():
+            tensor = np.concatenate((tensor, model_dict[key].cpu().numpy().flatten()))
+
+        return torch.tensor(tensor).squeeze()
+
+    def unflatten_model(self, flatted_model):
+        model_dict = self.state_dict()
+
+        new_model_dict = {}
+        for key in model_dict.keys():
+            t = model_dict[key].cpu().numpy()
+            shape = t.shape
+            length = len(t.flatten())
+
+            new_tensor = flatted_model[:length]
+            flatted_model = flatted_model[length:]
+            new_tensor = np.reshape(new_tensor, shape)
+
+            new_model_dict[key] = torch.tensor(new_tensor)
+
+        return new_model_dict
 
 
 def init_weights(model, init_type=config.INIT_TYPE, init_gain=config.INIT_GAIN):

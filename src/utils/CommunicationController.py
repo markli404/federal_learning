@@ -9,6 +9,9 @@ from ..utils.Printer import *
 import torch
 from collections import OrderedDict
 import time
+from torch.nn import CosineSimilarity
+from scipy import spatial
+from sklearn import metrics
 
 class CommunicationController:
     def __init__(self, clients):
@@ -17,6 +20,7 @@ class CommunicationController:
         self.num_clients = len(clients)
         self.clients = clients
         self.sampled_clients_indices = None
+        self.cos = CosineSimilarity(dim=0, eps=1e-6)
 
         # FedPNS
         self.test_count = np.zeros(len(clients))
@@ -43,6 +47,146 @@ class CommunicationController:
 
         message = f"Current clients have weights: {pretty_list(self.weight)} and have improvement: {pretty_list(weight)}"
         return message
+
+    def calculate_similarity(self, g1, g2):
+        return spatial.distance.cosine(g1, g2)
+
+    def l2_norm(self, gradient):
+        res = gradient * gradient
+        res = np.sum(res)
+
+        return np.sqrt(res)
+    def sample_all_clients(self):
+        sampled_client_indices = list(range(self.num_clients))
+        #TODO
+        sampled_client_indices = sampled_client_indices[1:]
+        self.sampled_clients_indices = sampled_client_indices
+        message = "All clients are selected"
+
+        return message, sampled_client_indices
+    def sample_clients_TSF(self):
+        def get_DDM(clients):
+            score = []
+            for client in clients:
+                val_at_s, _ = client.evaluate(client.client_previous, client.test_previous)
+                val_at_t, _ = client.evaluate(client.client_previous, client.test)
+                score.append(val_at_s - val_at_t)
+
+            return np.abs(np.array(score))
+
+        def get_MMD(clients):
+            def use_KL(s, t):
+                return 0
+
+            def use_l2_norm(s, t):
+                return np.linalg.norm(s-t)
+
+            def use_mmd_rbf(X, Y, gamma=1.0):
+                X, Y = X / 255, Y / 255
+                xx, yy, zz = np.matmul(X, X.T), np.matmul(Y, Y.T), np.matmul(X, Y.T)
+                rx = np.diag(np.diag(xx))
+                ry = np.diag(np.diag(yy))
+
+                dxx = rx.T + rx - 2. * xx  # Used for A in (1)
+                dyy = ry.T + ry - 2. * yy  # Used for B in (1)
+                dxy = rx.T + ry - 2. * zz  # Used for C in (1)
+
+                XX, YY, XY = (np.zeros(xx.shape),
+                              np.zeros(xx.shape),
+                              np.zeros(xx.shape))
+
+                bandwidth_range = [10, 15, 20, 50]
+
+                for a in bandwidth_range:
+                    XX += np.exp(-0.5 * dxx / a)
+                    YY += np.exp(-0.5 * dyy / a)
+                    XY += np.exp(-0.5 * dxy / a)
+
+                return np.mean(XX + YY - 2. * XY)
+
+            res = []
+            for client in clients:
+                test_at_s_by_class = client.test_previous.sort_by_class()
+                test_at_t_by_class = client.test.sort_by_class()
+
+                scores = []
+                for i in range(len(test_at_s_by_class)):
+                    s = test_at_s_by_class[i]
+                    t = test_at_t_by_class[i]
+
+                    score = use_mmd_rbf(s, t)
+                    scores.append(score)
+
+                res.append(np.max(scores) - np.min(scores))
+
+            return res
+
+        def get_cos_sim(clients):
+            score = []
+            for client in clients:
+                gradient = client.get_gradient_s(client.client_previous, client.client_current).numpy()
+                global_gradient = client.get_gradient_s(client.global_previous, client.global_current).numpy()
+
+                score.append(self.calculate_similarity(global_gradient, gradient))
+
+            return np.array(score)
+
+        try:
+            DDM = get_DDM(self.clients)
+            # MMD = get_MMD(self.clients)
+            # cos_sim = get_cos_sim(self.clients)
+        except:
+            DDM = np.ones(self.num_clients)
+
+        cos_sim = np.ones(self.num_clients)
+
+        I = np.array(cos_sim) * np.array(DDM)
+
+        I = I - config.FRACTION / 10
+        frequency = 1/(1 + np.exp(-20 * I))
+        random_numbers = np.random.uniform(0, 1, len(frequency))
+
+        sampled_client_indices = [idx for idx, val in enumerate(frequency) if val >= random_numbers[idx]]
+
+        # freshness
+        if config.FRESHNESS:
+            for client in self.clients:
+                if client.freshness <= 0 and client.id not in sampled_client_indices:
+                    sampled_client_indices.append(client.id)
+
+        self.sampled_clients_indices = sampled_client_indices
+        # message = f"DDM: {DDM}\n"
+        # message += f"MMD: {MMD}\n"
+        # message += f"cos_sim: {cos_sim}\n"
+        # message += f"I: {I}\n"
+        #  message += f"Frequency: {frequency}\n"
+        message = f"{sampled_client_indices} clients are selected for the next update with possibility {np.array(frequency)[sampled_client_indices]}."
+
+        return message, sampled_client_indices
+
+    def sample_clients_FAST(self):
+        def get_marginal_performance(clients):
+            score = []
+            for client in clients:
+                performance_after, _ = client.evaluate(client.client_current, client.test)
+                performance_before, _ = client.evaluate(client.global_current, client.test)
+                score.append((performance_after - performance_before) * 4)
+
+            return np.abs(np.array(score))
+
+        marginal_performance = get_marginal_performance(self.clients)
+        random_numbers = np.random.uniform(0, 1, len(marginal_performance))
+        sampled_client_indices = [idx for idx, val in enumerate(marginal_performance) if val >= random_numbers[idx]]
+
+        # # freshness
+        # for client in self.clients:
+        #     if client.freshness <= 0 and client.id not in sampled_client_indices:
+        #         sampled_client_indices.append(client.id)
+
+        self.sampled_clients_indices = sampled_client_indices
+        message = f"{sampled_client_indices} clients are selected."
+
+        return message, sampled_client_indices
 
     def sample_clients_test(self):
         if self.improvement is None:
@@ -71,24 +215,33 @@ class CommunicationController:
         return message, sampled_client_indices
 
 
-    def sample_clients_casestudy(self):
-        frequency = []
+    def sample_clients_casestudy(self, source_class):
         num_sampled_clients = max(int(config.FRACTION * self.num_clients), 1)
-        for client in self.clients:
-            if client.temporal_heterogeneous:
-                frequency.append(5)
-            else:
-                frequency.append(0.0000001)
 
-        frequency = np.array(frequency) / sum(frequency)
-        sampled_client_indices = np.random.choice(self.num_clients, num_sampled_clients, p=frequency, replace=False).tolist()
+        drift = []
+        non_drift = []
+        if source_class:
+            for client in self.clients:
+                if client.distribution[source_class[-1]] > 0:
+                    drift.append(client.id)
+                else:
+                    non_drift.append(client.id)
+
+            if num_sampled_clients <= len(drift):
+                sampled_client_indices = np.random.choice(drift, num_sampled_clients, replace=False).tolist()
+            else:
+                sampled_client_indices = np.random.choice(non_drift, num_sampled_clients - len(drift), replace=False)
+                sampled_client_indices = np.hstack((sampled_client_indices, drift)).tolist()
+        else:
+            sampled_client_indices = np.random.choice(self.num_clients, num_sampled_clients, replace=False).tolist()
+
         self.sampled_clients_indices = sampled_client_indices
         message = f"{sampled_client_indices} clients are selected for the next update."
 
         return message, sampled_client_indices
 
 
-    def sample_clients_fed_pns(self, clients, test_set):
+    def sample_clients_fed_pns(self):
         def average(grad_all):
 
             value_list = list(grad_all.values())
@@ -126,7 +279,6 @@ class CommunicationController:
         def test_part(clients, selected_clients, test_set, key):
             model = FedAvg(clients, selected_clients)
             _, loss_all = model_evaluation_simple(model, test_set)
-
             selected_clients.remove(key)
             model = FedAvg(clients, selected_clients)
             _, loss_part = model_evaluation_simple(model, test_set)
@@ -160,11 +312,11 @@ class CommunicationController:
             fedavg_coeff = [len(clients[idx]) for idx in selected_clients]
             fedavg_coeff = np.array(fedavg_coeff) / sum(fedavg_coeff)
 
-            new_model = copy.deepcopy(clients[0].model)
+            new_model = copy.deepcopy(clients[0].client_current)
             averaged_weights = OrderedDict()
 
             for it, idx in enumerate(selected_clients):
-                local_weights = clients[idx].model.state_dict()
+                local_weights = clients[idx].client_current.state_dict()
                 for key in new_model.state_dict().keys():
                     if it == 0:
                         averaged_weights[key] = fedavg_coeff[it] * local_weights[key]
@@ -173,6 +325,13 @@ class CommunicationController:
 
             new_model.load_state_dict(averaged_weights)
             return new_model
+
+        test_set = None
+        for client in self.clients:
+            if test_set is None:
+                test_set = copy.deepcopy(client.test)
+            else:
+                test_set + client.test
 
         selected_clients = list(range(self.num_clients))
 
@@ -191,31 +350,43 @@ class CommunicationController:
 
         expect_list = {}
         labeled = []
-        st = time.time()
 
         num_sampled_clients = max(int(config.FRACTION * self.num_clients), 1)
         while len(selected_clients) > num_sampled_clients:
+            st = time.time()
             expect_list = client_deleting(expect_list, max_now, selected_clients, local_gradients)
             # print(len(w_locals), expect_list)
-            key = max(expect_list.items(), key=operator.itemgetter(1))[0]
-            if expect_list[key] <= expect_list["all"]:
-                break
-            else:
-                labeled.append(key)
-                # TODO self.test_count[key][1] += 1
-                expect_list.pop("all")
-                loss_all, loss_pop = test_part(clients, selected_clients, test_set, key)
+            copy_expect_list = copy.deepcopy(expect_list)
+            copy_expect_list.pop('all')
+            key = max(copy_expect_list.items(), key=operator.itemgetter(1))[0]
+            et = time.time()
+            elapsed_time = et - st
+            print('Expect_list:', elapsed_time, 'seconds')
 
-                if loss_all < loss_pop:
-                    selected_clients.append(key)
-                    break
-                else:
-                    local_gradients.pop(key)
-                    max_now = expect_list[key]
-                    expect_list.pop(key)
-        et = time.time()
-        elapsed_time = et - st
-        print('Select Samples:', elapsed_time, 'seconds')
+            # if expect_list[key] <= expect_list["all"]:
+            #     break
+            # else:
+            #     labeled.append(key)
+            #     expect_list.pop("all")
+            #     loss_all, loss_pop = test_part(self.clients, selected_clients, test_set, key)
+            #
+            #     if loss_all < loss_pop:
+            #         selected_clients.append(key)
+            #         break
+            #     else:
+            #         local_gradients.pop(key)
+            #         max_now = expect_list[key]
+            #         expect_list.pop(key)
+
+
+            labeled.append(key)
+            expect_list.pop("all")
+            loss_all, loss_pop = test_part(self.clients, selected_clients, test_set, key)
+
+            local_gradients.pop(key)
+            max_now = expect_list[key]
+            expect_list.pop(key)
+
         self.sampled_clients_indices = selected_clients
         message = f"{selected_clients} clients are selected for the next update."
 
@@ -227,6 +398,7 @@ class CommunicationController:
 
         p = np.array(self.weight) / sum(self.weight)
         num_sampled_clients = max(int(config.FRACTION * self.num_clients), 1)
+        print(self.num_clients, config.FRACTION)
         client_indices = [i for i in range(self.num_clients)]
         sampled_client_indices = sorted(
             np.random.choice(a=client_indices, size=num_sampled_clients, replace=False, p=p).tolist())
@@ -236,25 +408,16 @@ class CommunicationController:
 
         return message, sampled_client_indices
 
-    def update_selected_clients(self, all_client=False):
+    def update_selected_clients(self, update_type, all_client=False):
         """Call "client_update" function of each selected client."""
-        selected_total_size = 0
-
         if all_client:
-            clients = self.clients
-            message = f"All clients are updated (with total sample size: "
-        else:
-            clients = []
-            for idx in self.sampled_clients_indices:
-                clients.append(self.clients[idx])
+            self.sampled_clients_indices = np.arange(0, self.num_clients)
 
-            message = f"...{len(self.sampled_clients_indices)} clients are selected and updated (with total sample size: "
+        for idx in self.sampled_clients_indices:
+            self.clients[idx].client_update(update_type)
 
-        for client in clients:
-            client.client_update()
-            selected_total_size += len(client)
+        message = f"...{len(self.sampled_clients_indices)} clients are selected and updated"
 
-        message += f"{str(selected_total_size)})!"
         return message
 
     def evaluate_selected_models(self):
@@ -266,7 +429,16 @@ class CommunicationController:
 
         return message
 
-    def transmit_model(self, model, to_all_clients=False):
+    def evaluate_all_models(self):
+        """Call "client_evaluate" function of each selected client."""
+        for client in self.clients:
+            client.client_evaluate()
+
+        message = f"...finished evaluation of {str(self.sampled_clients_indices)} selected clients!"
+
+        return message
+
+    def transmit_model(self, model, to_all_clients=True):
         if to_all_clients:
             target_clients = self.clients
             message = f"...successfully transmitted models to all {str(self.num_clients)} clients!"
@@ -277,9 +449,11 @@ class CommunicationController:
             message = f"...successfully transmitted models to {str(len(self.sampled_clients_indices))} selected clients!"
 
         for target_client in target_clients:
-            target_client.model = copy.deepcopy(model)
-            target_client.global_model = copy.deepcopy(model)
+            target_client.client_current = copy.deepcopy(model)
+            target_client.global_current = copy.deepcopy(model)
 
         return message
+
+
 
 

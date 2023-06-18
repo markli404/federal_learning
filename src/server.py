@@ -1,20 +1,25 @@
+import configparser
 import copy
 import logging
+import random
 import timeit
 
 import numpy as np
+import pandas
 import torch
 from torch.nn import CosineSimilarity
-
+import scipy
 from tqdm.auto import tqdm
 from collections import OrderedDict
 
 # custom packages
 from .models import *
 from .client import Client
+from .utils.DriftController import *
 from .utils.CommunicationController import *
 from .utils.DatasetController import *
 from .utils.Printer import *
+
 logger = logging.getLogger(__name__)
 
 
@@ -24,7 +29,7 @@ class Server(object):
         self.clients = None
         self.writer = writer
         self.num_clients = config.NUM_CLIENTS
-        self.runtype = config.RUNTYPE
+        self.runtype = config.RUN_TYPE
 
         self.model = eval(config.MODEL_NAME)(**config.MODEL_CONFIG)
 
@@ -34,278 +39,443 @@ class Server(object):
 
         self.data = None
         self.dataloader = None
-        self.num_upload = 0
+        self.round_upload = []
         self.round_accuracy = []
+
+        # drift related
+        self.drift_clients = []
+        self.source_classes = []
+        self.target_classes = []
+
+        # scaffold
+        self.c_global = None
+
+        # FGT
+        self.sop_cache = None
 
     def log(self, message):
         message = f"[Round: {str(self._round).zfill(4)}] " + message
-        print(message); logging.info(message)
-        del message; gc.collect()
+        print(message);
+        logging.info(message)
+        del message;
+        gc.collect()
 
     def setup(self):
         # initialize weights of the model
         torch.manual_seed(self.seed)
         init_net(self.model)
 
-        self.log(f"...successfully initialized model (# parameters: {str(sum(p.numel() for p in self.model.parameters()))})!")
+        self.log(
+            f"...successfully initialized model (# parameters: {str(sum(p.numel() for p in self.model.parameters()))})!")
 
         # initialize DatasetController
         self.DatasetController = DatasetController()
         self.log('...sucessfully initialized dataset controller for [{}]'.format(config.DATASET_NAME))
 
-        # create clients
-        if config.CLASS_SWAP:
-            initial_distribution = np.ones(10) / 10
-        else:
-            initial_distribution = np.array([1/7, 1/7, 1/7, 1/7, 1/7, 1/7, 1/7, 0, 0, 0])
+        # initialize DriftController
+        self.DriftController = DriftController(self.DatasetController)
+        self.log('...sucessfully initialized drift controller.')
 
-        initial_distribution = None
-        self.clients = self.create_clients(initial_distribution)
-        # select mutate clients
-        # self.select_drifted_clients(4)
+        # create clients
+        self.clients = self.create_clients()
 
         # initialize CommunicationController
         self.CommunicationController = CommunicationController(self.clients)
-        
+
         # send the model skeleton to all clients
         message = self.CommunicationController.transmit_model(self.model, to_all_clients=True)
+
         self.log(message)
 
-    def create_clients(self, distribution):
+    def create_clients(self, distribution=None):
         clients = []
-        drift_count = 0
-        for k in range(self.num_clients):
-            if distribution is None:
-                num = 6
-                initial_distribution = np.zeros(10)
-                idxs = np.random.choice(10, num, replace=False)
-                for idx in idxs:
-                    initial_distribution[idxs] = 1 / num
+        distribution = np.zeros((self.num_clients, config.NUM_CLASS))
+        # np.random.seed(config.NUM_SELECTED_CLASS)
+        client_idx = np.arange(self.num_clients)
+        np.random.shuffle(client_idx)
+        for i in client_idx:
+            class_pool = np.sum(distribution, axis=0)
+            class_pool = np.where(class_pool < int(config.NUM_SELECTED_CLASS * self.num_clients / config.NUM_CLASS))[0]
+            try:
+                selected_class = np.random.choice(class_pool, config.NUM_SELECTED_CLASS, replace=False)
+            except:
+                selected_class = np.random.choice(np.arange(config.NUM_CLASS),
+                                                  config.NUM_SELECTED_CLASS - len(class_pool), replace=False)
+                selected_class = np.append(selected_class, class_pool)
 
-                client = Client(client_id=k, device=self.device, distribution=initial_distribution)
-                if initial_distribution[1] != 0:
-                    client.temporal_heterogeneous = True
-                    drift_count += 1
-            else:
-                client = Client(client_id=k, device=self.device, distribution=distribution)
+            #TODO
+            if i == 0:
+                selected_class = np.arange(10)
+
+            for j in selected_class:
+                distribution[i][j] = 1
+
+                if i == 0:
+                    distribution[i][j] = 1 / 10 * config.NUM_SELECTED_CLASS
+
+        distribution = distribution / config.NUM_SELECTED_CLASS
+        for i in range(self.num_clients):
+            d = distribution[i]
+            client = Client(client_id=i, device=self.device, distribution=distribution[i])
             clients.append(client)
 
-        self.log(f"...successfully created all {str(self.num_clients)} clients! {str(drift_count / self.num_clients)} number of client will drift!")
+        self.log(f"...successfully created all {str(self.num_clients)} clients!")
         return clients
 
-
-    def select_drifted_clients(self, n):
-        indices = np.random.choice(self.num_clients, n, replace=False)
-
-        for index in indices:
-            self.clients[index].mutate()
-
-        self.log(f"Clients {str(indices)} will drift!")
-
-    def aggregate_models(self, sampled_client_indices, coefficients, with_previous_model=True):
+    def aggregate_models(self, sampled_client_indices, coefficients):
+        self.log(f"...with the weights of {str(coefficients)}.")
         new_model = copy.deepcopy(self.model)
         averaged_weights = OrderedDict()
 
         for it, idx in tqdm(enumerate(sampled_client_indices), leave=False):
-            local_weights = self.clients[idx].model.state_dict()
+            local_weights = self.clients[idx].client_current.state_dict()
             for key in self.model.state_dict().keys():
                 if it == 0:
                     averaged_weights[key] = coefficients[it] * local_weights[key]
                 else:
                     averaged_weights[key] += coefficients[it] * local_weights[key]
 
-        if with_previous_model:
-            self.model.to("cpu")
-            for key in self.model.state_dict().keys():
-                # averaged_weights[key] += self.model.state_dict()[key] * (1 - config.MODEL_COEFF * len(sampled_client_indices))
-                averaged_weights[key] += self.model.state_dict()[key] * (1 - config.MODEL_COEFF)
-            self.model.to(self.device)
+        self.model.to("cpu")
+        for key in self.model.state_dict().keys():
+            averaged_weights[key] += self.model.state_dict()[key] * (1 - np.sum(coefficients))
+        self.model.to(self.device)
 
         new_model.load_state_dict(averaged_weights)
+        return new_model
+
+    def aggregate_models_with_cache(self, sampled_client_indices, coeff):
+        new_model = copy.deepcopy(self.model)
+        averaged_weights = OrderedDict()
+
+        models = []
+
+        for i in range(self.num_clients):
+            if i in sampled_client_indices:
+                models.append(self.clients[i].client_current)
+            else:
+                if self.clients[i].client_previous is not None:
+                    models.append(self.clients[i].client_previous)
+
+        weight = 1 / len(models)
+
+        for i, model in enumerate(models):
+            local_weights = model.state_dict()
+            for key in self.model.state_dict().keys():
+                if i == 0:
+                    averaged_weights[key] = weight * local_weights[key]
+                else:
+                    averaged_weights[key] += weight * local_weights[key]
+
+        new_model.load_state_dict(averaged_weights)
+        return new_model
+
+    def aggregate_models_scaffold(self, sampled_client_indices, coeff):
+        total_delta = copy.deepcopy(self.model.state_dict())
+        for key in total_delta:
+            total_delta[key] = 0.0
+
+        for it, idx in tqdm(enumerate(sampled_client_indices), leave=False):
+            c_delta_para = self.clients[idx].c_delta_para
+            for key in total_delta:
+                total_delta[key] += c_delta_para[key]
+
+        for key in total_delta:
+            total_delta[key] = total_delta[key] / len(sampled_client_indices)
+
+        for i in sampled_client_indices:
+            client = self.clients[i]
+            c_global_para = client.c_global.state_dict()
+            for key in c_global_para:
+                if c_global_para[key].type() == 'torch.LongTensor':
+                    c_global_para[key] += total_delta[key].type(torch.LongTensor)
+                elif c_global_para[key].type() == 'torch.cuda.LongTensor':
+                    c_global_para[key] += total_delta[key].type(torch.cuda.LongTensor)
+                else:
+                    # print(c_global_para[key].type())
+                    c_global_para[key] += total_delta[key]
+
+            client.c_global.load_state_dict(c_global_para)
+        return self.aggregate_models(sampled_client_indices, coeff)
+
+    def aggregate_models_with_pruning(self, sampled_client_indices, coeff, eps=0.001):
+        def get_cossim(a, b):
+            return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+        def gradient_calibration(gradient, sum_of_gradient):
+            projection = np.dot(gradient, sum_of_gradient) / np.linalg.norm(sum_of_gradient) ** 2
+            if projection > 0:
+                gradient = gradient + projection * sum_of_gradient
+            else:
+                gradient = gradient - 2 * projection * sum_of_gradient
+            return gradient
+
+        def layerwise_calibration(gradient, sum_of_gradient):
+            gradient = self.model.unflatten_model(gradient)
+            sum_of_gradient = self.model.unflatten_model(sum_of_gradient)
+
+            for key in gradient.keys():
+                g_layer = gradient[key].numpy().flatten()
+                sog_layer = sum_of_gradient[key].numpy().flatten()
+                shape = gradient[key].shape
+                # cos_sim = get_cossim(g_layer, sog_layer)
+                # print(key, cos_sim)
+                if cos_sim < 0.3:
+                    projection = np.dot(g_layer, sog_layer) / np.linalg.norm(sog_layer) ** 2
+                    if projection > 0:
+                        g_layer = g_layer + projection * sog_layer
+                    else:
+                        g_layer = g_layer - 2 * projection * sog_layer
+
+                    # cos_sim = get_cossim(g_layer, sog_layer)
+                    # print(key, cos_sim)
+
+                g_layer = torch.tensor(g_layer.reshape(shape))
+                gradient[key] = g_layer
+
+            return self.model.flatten_model(gradient)
+
+
+        def aggregate_model(sum_of_gradient):
+            new_model = copy.copy(self.model)
+            new_model.to('cpu')
+            new_weights = new_model.state_dict()
+            global_gradient = self.model.unflatten_model(sum_of_gradient)
+            for key in new_model.state_dict().keys():
+                new_weights[key] = new_weights[key] - 1 * global_gradient[key]
+
+            new_model.load_state_dict(new_weights)
+            return new_model
+
+        # get gradient (delta) of selected clients
+        gradients = []
+        iid = self.clients[0].get_gradient()
+        for i in sampled_client_indices:
+            gradient = self.clients[i].get_gradient()
+            gradients.append(gradient)
+        gradients = np.array(gradients)
+
+        # get sum of gradient
+        sum_of_gradient = np.sum(gradients, axis=0) / len(gradients)
+        sop = sum_of_gradient
+        if self.sop_cache is None:
+            self.sop_cache = sum_of_gradient - 2 * 0.001
+
+        # test the change of calibration
+        print('sum of gradient before calibration', get_cossim(iid, sum_of_gradient))
+
+        while np.linalg.norm(sop - self.sop_cache) > eps and True:
+            for i, g in enumerate(gradients):
+
+                cos_sim = np.dot(sop, g) / (np.linalg.norm(sop) * np.linalg.norm(g))
+                if cos_sim < 0.8:
+                    # iid_cossim = get_cossim(g, iid)
+                    # print(i, iid_cossim)
+                    calibrated_gradient = layerwise_calibration(g, sop)
+                    gradients[i] = calibrated_gradient
+                    cos_sim_new = np.dot(sop, calibrated_gradient) / (np.linalg.norm(sop) * np.linalg.norm(calibrated_gradient))
+                    # iid_cossim = get_cossim(calibrated_gradient, iid)
+                    # print(i, iid_cossim)
+
+            self.sop_cache = sum_of_gradient
+            sum_of_gradient = np.sum(gradients, axis=0) / len(gradients)
+            sop = sum_of_gradient
+
+
+
+        # client = self.clients[0]
+        # client_current = copy.deepcopy(client.client_current)
+        # client_current = client_current.state_dict()
+        # client_global = copy.deepcopy(client.global_current)
+        #
+        # averaged_weights = client.get_gradient()
+        #
+        # new_model = client_global.unflatten_model(averaged_weights)
+        # client_global.to('cpu')
+        # client_global = client_global.state_dict()
+        # for key in client_global.keys():
+        #     client_global[key] = client_global[key] - new_model[key]
+        #     a = np.subtract(client_global[key], client_current[key])
+        #     print(a)
+        print('sum of gradient before calibration', get_cossim(iid, sum_of_gradient))
+        new_model = aggregate_model(sum_of_gradient)
+
         return new_model
 
     def calculate_similarity(self, model_1, model_2):
         # tensor_1 = model_1.flatten_model()
         tensor_1 = model_1
         tensor_2 = model_2.flatten_model()
-        assert(tensor_1.shape[0] == tensor_2.shape[0])
+        assert (tensor_1.shape[0] == tensor_2.shape[0])
 
         return self.cos(tensor_1, tensor_2).numpy().item()
 
-    def update_model(self, sampled_client_indices):
+    def get_perfect_coeff_LS(self, sampled_client_indices):
+        D = []
+        for i in sampled_client_indices:
+            client = self.clients[i]
+            D.append(client.distribution)
+
+        penalty = 0.3
+
+        A = np.array(D).T
+        I = np.identity(len(sampled_client_indices)) * penalty
+        A = np.vstack([A, I])
+
+        b = np.ones(config.NUM_CLASS) / config.NUM_CLASS * len(sampled_client_indices)
+        p = np.ones(len(sampled_client_indices)) * penalty
+        b = np.hstack([b, p])
+
+        coeff = scipy.optimize.nnls(A, b)[0]
+        coeff = coeff / np.sum(coeff) * len(sampled_client_indices) / self.num_clients
+
+        d = np.matmul(np.array(D).T, coeff)
+        print(d)
+        return coeff
+
+    def get_perfect_coeff_MC(self, sampled_client_indices):
+        A = []
+        for i in sampled_client_indices:
+            client = self.clients[i]
+            A.append(client.distribution)
+
+        A = np.array(A).T
+        target_coeff = 1 / self.num_clients
+        target_distribution = np.ones(config.NUM_CLASS) / config.NUM_CLASS
+        best_coeff = None
+        best_residual = 100000
+        best_distribution = None
+        for i in range(1000000):
+            coeff = [random.uniform(target_coeff * 0.4, target_coeff * 1.6) for j in range(len(sampled_client_indices))]
+            current_distribution = np.matmul(A, coeff)
+            current_distribution = current_distribution / np.sum(current_distribution)
+            residual = np.linalg.norm(current_distribution - target_distribution)
+            if residual < best_residual:
+                best_residual = residual
+                best_coeff = coeff
+                best_distribution = current_distribution
+        best_coeff = best_coeff / np.sum(best_coeff) * len(sampled_client_indices) / self.num_clients
+        return best_coeff
+
+    def get_blanced_coeff(self, sampled_client_indices):
+        num_of_drifts = 0
+        for i in sampled_client_indices:
+            if self.clients[i].drift:
+                num_of_drifts += 1
+
+        coeff = []
+        for i in sampled_client_indices:
+            if self.clients[i].drift:
+                coeff.append(1 / num_of_drifts)
+            else:
+                coeff.append(1 / (len(sampled_client_indices) - num_of_drifts))
+
+        coeff = coeff / np.sum(coeff) * len(sampled_client_indices) / self.num_clients
+        return coeff
+
+    def get_uniformed_coeff(self, sampled_client_indices):
+        return np.ones(len(sampled_client_indices)) / len(sampled_client_indices)
+
+    def update_model(self, sampled_client_indices, coeff_method, update_method):
         """Average the updated and transmitted parameters from each selected client."""
         if not sampled_client_indices:
             message = f"None of the clients were selected"
+            self.round_upload.append(0)
             self.log(message)
             return
 
-        message = f"Aggregate updated weights of {len(sampled_client_indices)} clients...!"
+        message = f"Updating {sampled_client_indices} clients...!"
         self.log(message)
-        self.num_upload += len(sampled_client_indices)
+        self.round_upload.append(len(sampled_client_indices))
 
-        fedavg_coeff = [len(self.clients[idx]) for idx in sampled_client_indices]
-        fedavg_coeff = np.array(fedavg_coeff) / sum(fedavg_coeff)
-        fedavg_model = self.aggregate_models(sampled_client_indices, fedavg_coeff, with_previous_model=False)
-
-        if self.runtype in ['fedavg', 'case_study', 'fedpns']:
-            self.model = fedavg_model
-            message = f"...updated weights of {len(sampled_client_indices)} clients are successfully averaged!"
-        else:
-            current_round_similarities = []
-            last_round_similarities = []
-
-            for idx in sampled_client_indices:
-                current_round_similarities.append(self.calculate_similarity(self.clients[idx].get_gradient(), fedavg_model))
-                last_round_similarities.append(self.calculate_similarity(self.clients[idx].get_gradient(), self.model))
-
-            similarities = np.array(current_round_similarities) + np.array(last_round_similarities)
-            # similarities = similarities / sum(similarities) * (config.MODEL_COEFF * len(sampled_client_indices))
-            similarities = similarities / sum(similarities) * config.MODEL_COEFF
-            self.model = self.aggregate_models(sampled_client_indices, similarities)
-
-            message = f"...updated weights of {len(sampled_client_indices)} clients are successfully updated based on coeff: {pretty_list(similarities)}!"
-
+        coeff = coeff_method(sampled_client_indices)
         self.log(message)
+        self.model = update_method(sampled_client_indices, coeff)
 
-    def train_federated_model_test(self):
-        """Do federated training."""
+
+    def train_without_drift(self, sample_method, coeff_method, update_method, update_type=config.RUN_TYPE):
         # assign new training and test set based on distribution
-        # (self._round >= config.DRIFT * config.NUM_ROUNDS)
-        self.DatasetController.update_clients_datasets(self.clients, False)
-
+        self.DriftController.enforce_drift(self.clients, None)
         # train all clients model with local dataset
-        message = self.CommunicationController.update_selected_clients(all_client=True)
+        message = self.CommunicationController.update_selected_clients(update_type, all_client=True)
         self.log(message)
 
-        # update client selection weight
-        message = self.CommunicationController.update_weight()
-        self.log(message)
+        message, sampled_client_indices = sample_method()
 
-        # select clients based on weights
-        if self._round <= 2:
-            message, sampled_client_indices = self.CommunicationController.sample_clients()
-        else:
-            message, sampled_client_indices = self.CommunicationController.sample_clients_test()
         self.log(message)
-
-        for index in sampled_client_indices:
-            self.clients[index].just_updated = True
 
         # evaluate selected clients with local dataset
-        message = self.CommunicationController.evaluate_selected_models()
-        self.log(message)
+        # message = self.CommunicationController.evaluate_all_models()
+        # self.log(message)
 
         # update model parameters of the selected clients and update the global model
-        self.update_model(sampled_client_indices)
-
-        # send global model to the selected clients
-        message = self.CommunicationController.transmit_model(self.model, to_all_clients=True)
-        self.log(message)
-
-    def train_case_study(self):
-        """Do federated training."""
-        # assign new training and test set based on distribution
-        # (self._round >= config.DRIFT * config.NUM_ROUNDS)
-        self.DatasetController.update_clients_datasets(self.clients, (self._round >= config.DRIFT * config.NUM_ROUNDS))
-
-        # select clients based on weights
-        message, sampled_client_indices = self.CommunicationController.sample_clients_casestudy()
-        self.log(message)
+        self.update_model(sampled_client_indices, coeff_method, update_method)
 
         # send global model to the selected clients
         message = self.CommunicationController.transmit_model(self.model)
         self.log(message)
 
-        # train all clients model with local dataset
-        message = self.CommunicationController.update_selected_clients(all_client=False)
-        self.log(message)
-
-        # evaluate selected clients with local dataset
-        message = self.CommunicationController.evaluate_selected_models()
-        self.log(message)
-
-        # update model parameters of the selected clients and update the global model
-        self.update_model(sampled_client_indices)
-
-    def train_fedpns(self):
+    def train_with_drift_after_converge(self, sample_method, coeff_method, update_method, update_type=config.RUN_TYPE, drift_type=config.DRIFT_TYPE):
         # assign new training and test set based on distribution
-        self.DatasetController.update_clients_datasets(self.clients, (self._round >= config.DRIFT * config.NUM_ROUNDS))
+        self.DriftController.enforce_drift(self.clients, drift_type)
 
         # train all clients model with local dataset
-        message = self.CommunicationController.update_selected_clients(all_client=True)
+        message = self.CommunicationController.update_selected_clients(update_type, all_client=True)
         self.log(message)
 
-        # select clients based on weights
-        _, test_set = self.get_test_dataset()
-        message, sampled_client_indices = self.CommunicationController.sample_clients_fed_pns(self.clients, test_set)
+        message, sampled_client_indices = sample_method()
+
+        for client in self.clients:
+            if client.id in sampled_client_indices:
+                client.global_previous = client.global_current
+                client.client_previous = client.client_current
+                client.test_previous = client.test
+                client.freshness = 1
+            else:
+                client.freshness -= 0.4
+
         self.log(message)
 
         # evaluate selected clients with local dataset
-        message = self.CommunicationController.evaluate_selected_models()
-        self.log(message)
+        # message = self.CommunicationController.evaluate_all_models()
+        # self.log(message)
 
         # update model parameters of the selected clients and update the global model
-        self.update_model(sampled_client_indices)
-
-        # send global model to the selected clients
-        message = self.CommunicationController.transmit_model(self.model, True)
-        self.log(message)
-
-    def train_federated_model(self):
-        """Do federated training."""
-        # assign new training and test set based on distribution
-        self.DatasetController.update_clients_datasets(self.clients, (self._round >= config.DRIFT * config.NUM_ROUNDS))
-
-        # train all clients model with local dataset
-        message = self.CommunicationController.update_selected_clients(all_client=True)
-        self.log(message)
-
-        # update client selection weight
-        message = self.CommunicationController.update_weight()
-        self.log(message)
-
-        # select clients based on weights
-        if self._round <= 2:
-            message, sampled_client_indices = self.CommunicationController.sample_clients()
-        else:
-            message, sampled_client_indices = self.CommunicationController.sample_clients_test()
-        self.log(message)
-
-        # evaluate selected clients with local dataset
-        message = self.CommunicationController.evaluate_selected_models()
-        self.log(message)
-
-        # update model parameters of the selected clients and update the global model
-        self.update_model(sampled_client_indices)
+        self.update_model(sampled_client_indices, coeff_method, update_method)
 
         # send global model to the selected clients
         message = self.CommunicationController.transmit_model(self.model)
         self.log(message)
+
 
     def train_fedavg(self):
         """Do federated training."""
         # assign new training and test set based on distribution
-        # (self._round >= config.DRIFT * config.NUM_ROUNDS)
-        self.DatasetController.update_clients_datasets(self.clients, (self._round >= config.DRIFT * config.NUM_ROUNDS))
+        self.enforce_drift()
+        self.DatasetController.update_clients_datasets(self.clients, self.drift_clients, self.source_classes,
+                                                       self.target_classes, True)
+
+        # train all clients model with local dataset
+        message = self.CommunicationController.update_selected_clients(all_client=True)
+        self.log(message)
 
         # select clients based on weights
-        message, sampled_client_indices = self.CommunicationController.sample_clients_random()
+        if self._round < 15:
+            message, sampled_client_indices = self.CommunicationController.sample_all_clients()
+        else:
+            message, sampled_client_indices = self.CommunicationController.sample_clients_random()
         self.log(message)
+
+        # evaluate selected clients with local dataset
+        # message = self.CommunicationController.evaluate_selected_models()
+        # self.log(message)
+
+        # update model parameters of the selected clients and update the global model
+        self.update_model(sampled_client_indices)
 
         # send global model to the selected clients
         message = self.CommunicationController.transmit_model(self.model)
         self.log(message)
 
-        # train all clients model with local dataset
-        message = self.CommunicationController.update_selected_clients(all_client=False)
-        self.log(message)
-
-        # evaluate selected clients with local dataset
-        message = self.CommunicationController.evaluate_selected_models()
-        self.log(message)
-
-        # update model parameters of the selected clients and update the global model
-        self.update_model(sampled_client_indices)
 
     def evaluate_global_model(self):
         """Evaluate the global model using the global holdout dataset (self.data)."""
@@ -319,20 +489,20 @@ class Server(object):
         self.model.to(self.device)
 
         test_loss, correct = 0, 0
-        correct_per_class = np.zeros(10)
-        total_per_class = np.zeros(10)
+        correct_per_class = np.zeros(config.NUM_CLASS)
+        total_per_class = np.zeros(config.NUM_CLASS)
         with torch.no_grad():
             for data, labels in global_test_set.get_dataloader():
                 data, labels = data.float().to(self.device), labels.long().to(self.device)
                 outputs = self.model(data)
                 test_loss += eval(config.CRITERION)()(outputs, labels).item()
-                
+
                 predicted = outputs.argmax(dim=1, keepdim=True)
                 correct += predicted.eq(labels.view_as(predicted)).sum().item()
 
                 labels = labels.cpu().numpy()
                 predicted = predicted.cpu().numpy().flatten()
-                for i in range(10):
+                for i in range(config.NUM_CLASS):
                     c = np.where(labels == i)[0].tolist()
                     if not c:
                         continue
@@ -340,7 +510,7 @@ class Server(object):
                     predicted_i = predicted[c]
                     predicted_correct = np.where(predicted_i == i)[0]
                     correct_per_class[i] += len(predicted_correct)
-                
+
                 if self.device == "cuda": torch.cuda.empty_cache()
         self.model.to("cpu")
 
@@ -362,15 +532,16 @@ class Server(object):
         self.writer.add_scalar('Accuracy', test_accuracy, self._round)
 
         message = f"Evaluate global model's performance...!\
-            \n\t[Server] ...finished evaluation!\
-            \n\t=> Loss: {test_loss:.4f}\
-            \n\t=> Accuracy: {100. * test_accuracy:.2f}%\
-            \n\t=> Class Accuracy: {class_accuracy}\n"
+                \n\t[Server] ...finished evaluation!\
+                \n\t=> Loss: {test_loss:.4f}\
+                \n\t=> Accuracy: {100. * test_accuracy:.2f}%\
+                \n\t=> Class Accuracy: {class_accuracy}\n"
         self.log(message)
+
 
     def update_client_distribution(self, distribution, addition=False, everyone=False):
         for client in self.clients:
-            if client.temporal_heterogeneous or everyone:
+            if client.drift or everyone:
                 if addition:
                     client.distribution += distribution
                 else:
@@ -378,80 +549,92 @@ class Server(object):
 
                 self.log(f"Client {str(client.id)} has a shifted distribution: {str(client.distribution)}")
 
+
     def get_test_dataset(self):
         global_distribution = np.zeros(config.NUM_CLASS)
         for client in self.clients:
             global_distribution += client.distribution
         global_distribution = global_distribution / sum(global_distribution)
 
-
         global_test_set = None
         for client in self.clients:
             if global_test_set is None:
-                global_test_set = client.test
+                global_test_set = copy.deepcopy(client.test)
             else:
                 global_test_set + client.test
 
         return global_distribution, global_test_set
 
+
     def class_swap(self, client, class_1=1, class_2=2):
         client.train.class_swap(class_1, class_2)
         client.test.class_swap(class_1, class_2)
+
 
     def fit(self):
         """Execute the whole process of the federated learning."""
         for r in range(config.NUM_ROUNDS):
             self._round = r + 1
 
-            # assign new distribution to drfited clients
-            if config.DRIFT * config.NUM_ROUNDS == self._round:
-                # config.FRACTION = 0.6
-                if config.CLASS_SWAP:
-                    drift = []
-                    for client in self.clients:
-                        self.class_swap(client)
-                        if client.temporal_heterogeneous:
-                            drift.append(client.id)
-
-                    print(drift)
-                else:
-                    new_dist = [1, 1, 1, 1, 1, 1, 1, 4, 4, 4]
-                    new_dist = np.array(new_dist) / sum(new_dist)
-                    self.update_client_distribution(new_dist, addition=False, everyone=False)
-
-                # weight = []
-                # for client in self.clients:
-                #     if client.temporal_heterogeneous:
-                #         weight.append(5)
-                #     else:
-                #         weight.append(1)
-                #
-                # weight = np.array(weight) / sum(weight)
-                # self.CommunicationController.weight = weight
-
-            if int(0.25 * config.NUM_ROUNDS) == self._round and config.RUNTYPE == 'our':
-                self.CommunicationController.transmit_model(model=self.model, to_all_clients=True)
-
             # train the model
-            if config.RUNTYPE == 'fedavg':
-                self.train_fedavg()
-            elif config.RUNTYPE == 'case_study':
-                self.train_case_study()
-            elif config.RUNTYPE == 'our':
-                self.train_federated_model_test()
-            elif config.RUNTYPE == 'fedpns':
-                self.train_fedpns()
+            """
+            train method takes following parameters
+                sample_method: method used to select client in the update
+                coeff_method: method used to calculate coeff for model aggregation
+                    get_uniformed_coeff(sampled_client_indices)
+            """
+            if False: #self._round < config.DRIFT[0]:
+                self.train_with_drift_after_converge(
+                    self.CommunicationController.sample_all_clients,
+                    self.get_uniformed_coeff,
+                    self.aggregate_models, update_type='fedavg', drift_type='None')
+            elif config.RUN_TYPE == 'fedavg':
+                self.train_with_drift_after_converge(
+                    self.CommunicationController.sample_clients,
+                    self.get_uniformed_coeff,
+                    self.aggregate_models)
+            elif config.RUN_TYPE in ['case_study', 'case_study_test']:
+                self.train_with_drift_after_converge(
+                    self.CommunicationController.sample_clients_casestudy,
+                    self.get_uniformed_coeff,
+                    self.aggregate_models)
+            elif config.RUN_TYPE == 'fedpns':
+                self.train_with_drift_after_converge(
+                    self.CommunicationController.sample_clients_fed_pns,
+                    self.get_uniformed_coeff,
+                    self.aggregate_models)
+            elif config.RUN_TYPE == 'fast':
+                self.train_with_drift_after_converge(
+                    self.CommunicationController.sample_clients_TSF,
+                    self.get_perfect_coeff_LS,
+                    self.aggregate_models)
+            elif config.RUN_TYPE == 'fedprox':
+                self.train_with_drift_after_converge(
+                    self.CommunicationController.sample_clients,
+                    self.get_uniformed_coeff,
+                    self.aggregate_models)
+            elif config.RUN_TYPE == 'scaffold':
+                self.train_with_drift_after_converge(
+                    self.CommunicationController.sample_clients,
+                    self.get_uniformed_coeff,
+                    self.aggregate_models_scaffold)
+            elif config.RUN_TYPE == 'new':
+                self.train_without_drift(self.CommunicationController.sample_all_clients,
+                                         self.get_uniformed_coeff,
+                                         self.aggregate_models_with_pruning)
+            else:
+                raise Exception("No federal learning method is found.")
 
             # evaluate the model
             self.evaluate_global_model()
 
-            message = f"Clients have uploaded their model {str(self.num_upload)} times！"
+            message = f"Clients have uploaded their model {str(sum(self.round_upload))} times！"
             self.log(message)
 
             message = f"Overall Accuracy is {str(sum(self.round_accuracy) / len(self.round_accuracy))}!"
             self.log(message)
 
         self.writer.add_text('accuracy', str(sum(self.round_accuracy) / len(self.round_accuracy)))
-        self.writer.add_text('freq', str(self.num_upload))
+        self.writer.add_text('freq', str(sum(self.round_upload)))
 
-        return self.round_accuracy
+        return self.round_accuracy, self.round_upload
