@@ -41,7 +41,7 @@ def main():
 
     if config.SAVE:
         df = pandas.DataFrame(res)
-        df.to_csv('{}_{}_class={}_layerwise.csv'.format(config.DATASET_NAME, config.RUN_TYPE, config.NUM_SELECTED_CLASS), index=False)
+        df.to_csv('{}_{}_class={}_test.csv'.format(config.DATASET_NAME, config.RUN_TYPE, config.NUM_SELECTED_CLASS), index=False)
     # bye!
     printer.print("...done all learning process!\n...exit program!")
 

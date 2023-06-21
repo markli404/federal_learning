@@ -6,7 +6,7 @@ class config:
     DRIFT_TYPE = 'class_swap'    # class_swap guass_noise
     DRITF_PERCENTAGE = None
     CLASS_SWAP = True
-    RUN_TYPE = "new" #"case_study"
+    RUN_TYPE = "fedavg" #"case_study"
     RUN_NAME = None
     BASE = None
 
@@ -29,10 +29,12 @@ class config:
     CACHE = False
     FRESHNESS = False
 
-    # fractions = [0.1, 0.3, 0.5, 0.7, 0.9, 1.1, 1.3]
+    # fractions = [0.1, 0.3, 0.5, 0.7s, 0.9, 1.1, 1.3]
     # fractions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]
 
+    # output config
     SAVE = True
+    SAVE_MODEL = True
 
     # global config
     SEED = 5959

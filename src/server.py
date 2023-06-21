@@ -476,6 +476,14 @@ class Server(object):
         message = self.CommunicationController.transmit_model(self.model)
         self.log(message)
 
+    def save_model(self):
+        path = os.path.join('models', self.runtype)
+        if not os.path.exists(path):
+            os.mkdir(path)
+
+        path = os.path.join(path, self.runtype + '_' + str(self._round) + '.pth')
+        torch.save({'model': self.model.state_dict()}, path)
+
 
     def evaluate_global_model(self):
         """Evaluate the global model using the global holdout dataset (self.data)."""
@@ -538,7 +546,6 @@ class Server(object):
                 \n\t=> Class Accuracy: {class_accuracy}\n"
         self.log(message)
 
-
     def update_client_distribution(self, distribution, addition=False, everyone=False):
         for client in self.clients:
             if client.drift or everyone:
@@ -548,7 +555,6 @@ class Server(object):
                     client.distribution = distribution
 
                 self.log(f"Client {str(client.id)} has a shifted distribution: {str(client.distribution)}")
-
 
     def get_test_dataset(self):
         global_distribution = np.zeros(config.NUM_CLASS)
@@ -624,6 +630,10 @@ class Server(object):
                                          self.aggregate_models_with_pruning)
             else:
                 raise Exception("No federal learning method is found.")
+
+            # save model to evaluate gradient similarity
+            if config.SAVE_MODEL:
+                self.save_model()
 
             # evaluate the model
             self.evaluate_global_model()
