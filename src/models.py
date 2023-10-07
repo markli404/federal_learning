@@ -7,6 +7,7 @@ import torch.nn.init as init
 # custom packages
 from .config import config
 
+
 #################################
 # Models for federated learning #
 #################################
@@ -29,6 +30,7 @@ class TwoNN(nn.Module):
         x = self.fc3(x)
         return x
 
+
 # McMahan et al., 2016; 1,663,370 parameters
 class CNN(nn.Module):
     def __init__(self, name, in_channels, hidden_channels, num_hiddens, num_classes):
@@ -36,9 +38,11 @@ class CNN(nn.Module):
         self.name = name
         self.activation = nn.ReLU(True)
 
-        self.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=hidden_channels, kernel_size=(5, 5), padding=1, stride=1, bias=False)
-        self.conv2 = nn.Conv2d(in_channels=hidden_channels, out_channels=hidden_channels * 2, kernel_size=(5, 5), padding=1, stride=1, bias=False)
-        
+        self.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=hidden_channels, kernel_size=(5, 5), padding=1,
+                               stride=1, bias=False)
+        self.conv2 = nn.Conv2d(in_channels=hidden_channels, out_channels=hidden_channels * 2, kernel_size=(5, 5),
+                               padding=1, stride=1, bias=False)
+
         self.maxpool1 = nn.MaxPool2d(kernel_size=(2, 2), padding=1)
         self.maxpool2 = nn.MaxPool2d(kernel_size=(2, 2), padding=1)
         self.flatten = nn.Flatten()
@@ -57,6 +61,15 @@ class CNN(nn.Module):
         x = self.activation(self.fc1(x))
         x = self.fc2(x)
         return x
+
+    # def flatten_model(self):
+    #     model_dict = self.state_dict()
+    #     tensor = np.array([])
+    #
+    #     for key in model_dict.keys():
+    #         tensor = np.concatenate((tensor, model_dict[key].cpu().numpy().flatten()))
+    #
+    #     return torch.tensor(tensor).squeeze()
 
     def flatten_model(self, model_dict=None):
         if model_dict is None:
@@ -86,7 +99,6 @@ class CNN(nn.Module):
         return new_model_dict
 
 
-
 class LR(nn.Module):
     def __init__(self, in_channels, name):
         super(LR, self).__init__()
@@ -114,9 +126,11 @@ class CNN2(nn.Module):
         self.name = name
         self.activation = nn.ReLU(True)
 
-        self.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=hidden_channels, kernel_size=(5, 5), padding=1, stride=1, bias=False)
-        self.conv2 = nn.Conv2d(in_channels=hidden_channels, out_channels=hidden_channels * 2, kernel_size=(5, 5), padding=1, stride=1, bias=False)
-        
+        self.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=hidden_channels, kernel_size=(5, 5), padding=1,
+                               stride=1, bias=False)
+        self.conv2 = nn.Conv2d(in_channels=hidden_channels, out_channels=hidden_channels * 2, kernel_size=(5, 5),
+                               padding=1, stride=1, bias=False)
+
         self.maxpool1 = nn.MaxPool2d(kernel_size=(2, 2), padding=1)
         self.maxpool2 = nn.MaxPool2d(kernel_size=(2, 2), padding=1)
         self.flatten = nn.Flatten()
@@ -131,11 +145,20 @@ class CNN2(nn.Module):
         x = self.activation(self.conv2(x))
         x = self.maxpool2(x)
         x = self.flatten(x)
-    
+
         x = self.activation(self.fc1(x))
         x = self.fc2(x)
-        
+
         return x
+
+    # def flatten_model(self):
+    #     model_dict = self.state_dict()
+    #     tensor = np.array([])
+    #
+    #     for key in model_dict.keys():
+    #         tensor = np.concatenate((tensor, model_dict[key].cpu().numpy().flatten()))
+    #
+    #     return torch.tensor(tensor).squeeze()
 
     def flatten_model(self, model_dict=None):
         if model_dict is None:
@@ -210,9 +233,9 @@ def init_net(model, init_type=config.INIT_TYPE, init_gain=config.INIT_GAIN, gpu_
     Returns:
         An initialized torch.nn.Module instance.
     """
-    if len(gpu_ids) > 0:
-        assert (torch.cuda.is_available())
-        model.to(gpu_ids[0])
-        model = nn.DataParallel(model, gpu_ids)
+    # if len(gpu_ids) > 0:
+    #     assert (torch.cuda.is_available())
+    #     model.to(gpu_ids[0])
+    #     model = nn.DataParallel(model, gpu_ids)
     init_weights(model, init_type, init_gain)
     return model

@@ -1,3 +1,4 @@
+DatasetController.py
 import numpy as np
 import torch
 import logging
@@ -79,7 +80,7 @@ class CustomTensorDataset(Dataset):
 # 负责根据各种分布生成训练集
 class DatasetController:
     def __init__(self, dataset_name=config.DATASET_NAME):
-        dataset_name = dataset_name.upper()
+        # dataset_name = dataset_name.upper()
         # get dataset from torchvision.datasets if exists
         if hasattr(torchvision.datasets, dataset_name):
             # set transformation differently per dataset
@@ -97,7 +98,7 @@ class DatasetController:
                         torchvision.transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
                     ]
                 )
-            elif dataset_name in ["MNIST"]:
+            elif dataset_name in ["MNIST", "FashionMNIST"]:
                 transform = torchvision.transforms.ToTensor()
 
             # prepare raw training & test datasets

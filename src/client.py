@@ -60,6 +60,15 @@ class Client(object):
         # grad = grad / (len(self.train) * self.local_epoch * config.OPTIMIZER_CONFIG['lr'] / self.batch_size)
         return np.array(grad)
 
+    def set_gradient(self, gradient):
+        difference = np.subtract(self.get_gradient(), gradient)
+        print(np.linalg.norm(difference))
+        new_parameter = np.subtract(self.global_current.flatten_model(), gradient)
+        new_parameter = self.client_current.unflatten_model(new_parameter)
+
+        self.client_current.load_state_dict(new_parameter)
+
+
     def get_gradient_s(self, model1, model2, difference=False):
         grad = np.subtract(model1.flatten_model(), model2.flatten_model())
         if difference:
@@ -202,7 +211,7 @@ class Client(object):
             c_delta_para[key] = c_new_para[key] - c_local_para[key]
         self.c_local.load_state_dict(c_new_para)
         self.c_delta_para = c_delta_para
-        print(self.c_delta_para)
+        # print(self.c_delta_para)
 
     def evaluate(self, model, dataset):
         model.eval()

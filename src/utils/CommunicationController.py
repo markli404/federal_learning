@@ -58,8 +58,6 @@ class CommunicationController:
         return np.sqrt(res)
     def sample_all_clients(self):
         sampled_client_indices = list(range(self.num_clients))
-        #TODO
-        sampled_client_indices = sampled_client_indices[1:]
         self.sampled_clients_indices = sampled_client_indices
         message = "All clients are selected"
 
