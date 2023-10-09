@@ -54,7 +54,7 @@ class config:
     DEVICE = "cpu"
 
     # data config
-    DATA_PATH = './data/'
+    DATA_PATH = 'data/'
     DATASET_NAME = 'FashionMNIST'
     NUM_CLASS = 10
 
